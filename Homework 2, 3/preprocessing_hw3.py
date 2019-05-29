@@ -15,20 +15,17 @@ from sklearn.svm import LinearSVC
 from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier, \
     BaggingClassifier
 
-FEATURES = {'school_metro_rural': 2, 'school_metro_suburban': 2,
-            'school_metro_urban': 2, 'school_charter_t': 2,
-            'school_magnet_t': 2, 'primary_focus_area_Applied Learning': 2, 
-            'primary_focus_area_Health & Sports': 2, 'primary_focus_area_History & Civics': 2,
-            'primary_focus_area_Literacy & Language': 2, 'primary_focus_area_Math & Science': 2,
-            'primary_focus_area_Music & The Arts': 2, 'primary_focus_area_Special Needs': 2,
-            'resource_type_Books': 2, 'resource_type_Other': 2, 'resource_type_Other': 2,
-            'resource_type_Supplies': 2, 'resource_type_Technology': 2, 
-            'resource_type_Trips': 2, 'resource_type_Visitors': 2,'poverty_level_high poverty': 2,
-            'poverty_level_low poverty': 2, 'poverty_level_moderate poverty': 2,
-            'grade_level_Grades 3-5': 2, 'grade_level_Grades 6-8': 2,
-            'grade_level_Grades 9-12': 2, 'grade_level_Grades PreK-2': 2,
-            'total_price_including_optional_support': 4,
-            'students_reached': 4, 'eligible_double_your_impact_match_t': 2}
+CONT_FEATURES = ['total_price_including_optional_support',
+            'students_reached']
+CAT_FEATURES = ['school_metro',
+                'school_charter',
+                'school_magnet',
+                'primary_focus_area',
+                'teacher_prefix',
+                'resource_type',
+                'poverty_level',
+                'grade_level',
+                'eligible_double_your_impact_match']
 TARGET = 'over_60'
 
 CLASSIFIERS = {'Random Forest': RandomForestClassifier(),
@@ -39,6 +36,14 @@ CLASSIFIERS = {'Random Forest': RandomForestClassifier(),
     'KNN': KNeighborsClassifier(n_neighbors=3),
     'BAG': BaggingClassifier(DecisionTreeClassifier(max_depth=1))
             }
+PARAM_GRID = { 
+    'Random Forest':{'n_estimators': [10, 20], 'max_depth': [5, 10], 'max_features': ['sqrt','log2'],'min_samples_split': [2,10], 'n_jobs':[-1]},
+    'Logistic Regression': { 'penalty': ['l1','l2'], 'C': [0.001,0.1,1]},
+    'Ada Boost': { 'algorithm': ['SAMME', 'SAMME.R'], 'n_estimators': [1,10]},
+    'Decision Tree': {'criterion': ['gini', 'entropy'], 'max_depth': [1,5,10], 'max_features': [None,'sqrt','log2'],'min_samples_split': [2,5]},
+    'SVM' :{'penalty': ['l2']},
+    'KNN' :{'n_neighbors': [1,5,10],'weights': ['uniform','distance'],'algorithm': ['auto','ball_tree','kd_tree']},
+           }
 
 def pre_process(filename):
     '''
@@ -96,20 +101,47 @@ def time_split_df(df, date_col, test_sets):
         lb = df[date_col].min() + (i * time_period)
         ub = df[date_col].min() + ((i + 1) * time_period)
         train = df.loc[(df[date_col] < lb)]
-        test = df.loc[(df[date_col] >= lb) & (df[date_col] < ub)]
+        test = df.loc[(df[date_col] >= lb + np.timedelta64(60, 'D')) \
+            & (df[date_col] < ub)]
         train_test_sets.append((train, test))
     return train_test_sets
 
-def eval_metrics(test, fitted_clfs, thresholds):
-    X_test = test[FEATURES.keys()]
+def clean_features(project):
+    project['students_reached'] = \
+        project['students_reached'].fillna(
+            project['students_reached'].mean())
+    project = create_dummies(
+        project, colnames=CAT_FEATURES)
+    return project
+
+def process_sets(train_test_sets):
+    '''
+    Given the train, test sets, cleans features in all dataframes and returns
+    a tuple of the new train, test sets and a list of target features.
+    '''
+    old_cols = train_test_sets[0][0].columns
+    for ind, train_test_set in enumerate(train_test_sets):
+        train = train_test_set[0]
+        train = clean_features(train)
+        test = train_test_set[1]
+        test = clean_features(test)
+        train_test_sets[ind] = (train, test)
+    new_cols = train_test_sets[0][0].columns
+    features = [col for col in new_cols if col not in old_cols]
+    features = features + CONT_FEATURES
+    return train_test_sets, features
+
+def eval_metrics(test, features, fitted_clfs, thresholds):
+    X_test = test[features]
     y_test = test[TARGET]
     for clf_name, clf in fitted_clfs.items():
-        if clf_name == 'SVM':
+        if 'SVM' in clf_name:
             predicted_y = clf.decision_function(X_test)
         else:
             predicted_y = clf.predict_proba(X_test)[:,1]
         calc_threshold = lambda x, y: 0 if x < y else 1
         print(clf_name)
+        print(clf.get_params())
         for threshold in thresholds:
             predictions = np.array(
                 [calc_threshold(score, threshold) for score in predicted_y])
@@ -129,30 +161,27 @@ def eval_metrics(test, fitted_clfs, thresholds):
                 predictions, y_test))
             print("    recall %.2f" % calculate_recall_at_threshold(
                 predictions, y_test))
-            '''
-            print("At threshold " + str(threshold))
-            print(classification_report(y_test, predictions))
-            '''
+            print("    f1 %.2f" % calculate_f1_at_threshold(
+                predictions, y_test))
+
         print("ROC AUC Score %.2f" % roc_auc_score(y_test, predicted_y))           
         plot_precision_recall_n(y_test, predicted_y, clf_name, "show")
         print("----------")
         print()
 
-def threshold_cutoff(train_test, fitted_clfs, pop_pct):
-    X_test = train_test[1][FEATURES.keys()]
+def threshold_cutoff(train_test, features, fitted_clfs, pop_pct):
+    X_test = train_test[1][features]
     y_test = train_test[1][TARGET]
     cutoffs = {}
     for clf_name, clf in fitted_clfs.items():
-        if clf_name == 'SVM':
+        if 'SVM' in clf_name:
             predicted_y = clf.decision_function(X_test)
         else:
             predicted_y = clf.predict_proba(X_test)[:,1]
         predicted_y = np.sort(predicted_y)
         predicted_y = list(predicted_y[::-1])
-        print(len(predicted_y))
         top_count = round(pop_pct * len(predicted_y))
         cutoffs[clf_name] = predicted_y[top_count]
-    print(cutoffs)
     return cutoffs
 
 def calculate_accuracy_at_threshold(predicted_scores, y_test):
@@ -170,30 +199,45 @@ def calculate_recall_at_threshold(predicted_scores, y_test):
         confusion_matrix(y_test, predicted_scores).ravel()
     return 1.0 * true_positives / (false_negatives + true_positives)
 
-def fit_clfs(train_test, 
+def calculate_f1_at_threshold(predicted_scores, y_test):
+    precision = calculate_precision_at_threshold(predicted_scores, y_test)
+    recall = calculate_recall_at_threshold(predicted_scores, y_test)
+    return 2 * (precision * recall) / (precision + recall)
+
+def fit_clfs(train_test, features,
     clfs=['Random Forest', 'Ada Boost', 'Logistic Regression', 'SVM',\
-    'Decision Tree', 'KNN', 'BAG']):
+    'Decision Tree', 'KNN', 'BAG'], param_loop=False):
     '''
-    Given training sets of features and predictors and a list of names classifiers
-    to use, returns a dictionary of the classifiers' names as keys and fitted models
-    as corresponding values.
+    Given training sets of features and predictors and a list of names 
+    classifiers to use, returns a dictionary of the classifiers' names as
+    keys and fitted models as corresponding values.
     '''
+
     train = train_test[0]
-    X_train = train[FEATURES.keys()]
+    X_train = train[features]
     y_train = train[TARGET]
     fitted_clfs = {}
     for clf in clfs:
         classifier = CLASSIFIERS.get(clf)
-        model = classifier.fit(X_train, y_train)
-        fitted_clfs[clf] = model
+        if param_loop:
+            params = PARAM_GRID.get(clf)
+            if params:
+                for param, val_list in params.items():
+                    for val in val_list:
+                        classifier = classifier.set_params(**{param: val})
+                        model = classifier.fit(X_train, y_train)
+                        fitted_clfs[clf + " " +str(param) + ": " + str(val)] = model
+        else:
+            model = classifier.fit(X_train, y_train)
+            fitted_clfs[clf] = model
     return fitted_clfs
 
-def eval_test_sets(train_test_sets, thresholds, clf_list=['Random Forest', 'Ada Boost', 'Logistic Regression', 'SVM',\
-    'Decision Tree', 'KNN', 'BAG']):
+def eval_test_sets(train_test_sets, features, thresholds, clf_list=['Random Forest', 'Ada Boost', 'Logistic Regression', 'SVM',\
+    'Decision Tree', 'KNN', 'BAG'], loop_params=False):
     for i, train_test in enumerate(train_test_sets):
         print("Training and test set " + str(i + 1))
-        fitted_clfs = fit_clfs(train_test, clfs=clf_list)
-        eval_metrics(train_test[1], fitted_clfs, thresholds)
+        fitted_clfs = fit_clfs(train_test, features, clfs=clf_list, param_loop=loop_params)
+        eval_metrics(train_test[1], features, fitted_clfs, thresholds)
 
 def plot_precision_recall(predicted_scores, true_labels):
     precision, recall, thresholds = precision_recall_curve(true_labels, predicted_scores)

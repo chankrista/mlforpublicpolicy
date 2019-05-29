@@ -1,0 +1,1 @@
+Files in this folder are my submission for homeworks 2, 3, and 5. The .ipynb files are titled according to assignment and contain all writeups.
